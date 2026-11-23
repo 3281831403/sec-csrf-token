@@ -1,4 +1,4 @@
-表单加了 CSRF token，跨站提交却还是成功，日志里 token 一直是同一个：`issue` 只用时间戳和 nonce 做 HMAC，没有把 `session_id` 纳入签名，A 用户的 token 能直接给 B 用；`issue` 写入秒级时间戳，`verify` 却按毫秒比较，token 要么瞬间过期要么长期不过期；`verify` 用 `==` 比较签名，存在可被利用的时序侧信道；`verify` 只看 token 的字段格式、不重新计算 HMAC，任意形状正确的伪造 token 都能通过；`double_submit` 只比较 cookie 与表单两个字符串是否相等，不验签，攻击者同时伪造两处即可；`double_submit` 不核对 cookie token 与 `session_id` 的绑定，跨会话也能通过；`rotate` 生成了新 token 却不记录旧 token 的撤销下限，旧 token 仍可重放；`nonce_for` 只用 `counter` 计算，多个会话在同一 counter 上得到相同 nonce；`ttl_ok` 对负 TTL 不做拒绝，等价于永不失效；`csrf_batch` 复用 secret 和首个请求的 token 状态，第二个请求会误中第一个请求的 token。csrf/token.py 是核心，tests/test_token.py 15个红。要修的是：恢复 session 绑定、统一秒级时间窗、改用 `hmac.compare_digest`、完整验签、双提交验签、双提交会话绑定、轮换时撤销旧 token、让 nonce 带会话作用域、拒绝负 TTL、隔离批量请求。
+表单加了 CSRF token，跨站提交却还是成功，日志里 token 一直是同一个：签发只用时间戳和随机数，没有绑定会话，A 的 token 可以给 B 用；签发用秒级时间戳，校验按毫秒比较，过期判定完全错位；签名比较用普通的等号判断，不是恒定时间比较；校验只看格式不看签名，任意构造的 token 都能通过；双提交只比较两个 token 是否相等，不做验签，攻击者可以同时伪造两边；双提交不检查 Cookie 里的 token 与会话的绑定关系；轮换生成新 token 但不记录旧 token，旧 token 还能重放；随机数只依赖计数器，多个用户之间会撞同一个值；时间窗判定允许负的有效期，token 永不失效；批量校验复用密钥与状态，后一个请求命中前一个请求的 token。csrf/token.py 是核心，tests/test_token.py 15个红。要修的是：按上面的顺序把 10 个缺陷逐个修掉。
 
 ## 运行方式
 
