@@ -39,6 +39,100 @@ MIN_SECRET_BYTES = 32
 MAX_TTL = 300
 CONSTANT_TIME_COMPARE = "compare_digest"
 
+_DIGITS = frozenset("0123456789")
+_HEX_LOWER = frozenset("0123456789abcdef")
+_SESSION_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789._-"
+)
+
+# 内存态轮换撤销下限：键为 (secret 指纹, session_id)，值为该会话当前下限
+# （Unix 秒）。时间戳早于下限的 token 必须被 verify/double_submit/csrf_batch
+# 拒绝。除这一只读用途外，请求之间不得共享任何状态。
+_REVOCATION_FLOORS: dict[tuple[str, str], int] = {}
+
+
+def _is_int(value: object) -> bool:
+    """bool 不算 int（True/False 是 int 的子类，必须显式排除）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_session_id(session_id: object) -> bool:
+    return (
+        isinstance(session_id, str)
+        and 1 <= len(session_id) <= 64
+        and all(ch in _SESSION_CHARS for ch in session_id)
+    )
+
+
+def _valid_nonce(nonce: object) -> bool:
+    return (
+        isinstance(nonce, str)
+        and len(nonce) == NONCE_LENGTH
+        and all(ch in _HEX_LOWER for ch in nonce)
+    )
+
+
+def _secret_fingerprint(secret: str) -> str:
+    """以 secret 的 SHA-256 指纹作为撤销下限键，避免明文密钥常驻状态字典。"""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _sign(secret: str, session_id: str, ts_str: str, nonce: str) -> str:
+    """计算 ``v1:<session_id>:<ts10>:<nonce16>`` 的 HMAC-SHA256（小写 hex）。"""
+    message = f"{TOKEN_PREFIX}:{session_id}:{ts_str}:{nonce}".encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+
+
+def _parse_token(token: object) -> tuple[int, str, str] | None:
+    """严格解析 95 字符 token；任何形状/字符集不符都返回 None。"""
+    if not isinstance(token, str) or len(token) != TOKEN_LENGTH:
+        return None
+    parts = token.split(":")
+    if len(parts) != 4:
+        return None
+    version, ts_str, nonce, mac = parts
+    if version != TOKEN_PREFIX:
+        return None
+    if len(ts_str) != TIMESTAMP_WIDTH or not all(
+        ch in _DIGITS for ch in ts_str
+    ):
+        return None
+    if len(nonce) != NONCE_LENGTH or not all(
+        ch in _HEX_LOWER for ch in nonce
+    ):
+        return None
+    if len(mac) != MAC_LENGTH or not all(
+        ch in _HEX_LOWER for ch in mac
+    ):
+        return None
+    return int(ts_str), nonce, mac
+
+
+def _signed_and_not_revoked(
+    secret: str, session_id: str, token: str
+) -> bool:
+    """验签 + 会话绑定 + 轮换撤销下限检查；不判定 TTL。
+
+    签名比较只能使用 ``hmac.compare_digest``。畸形输入返回 False，不抛异常。
+    """
+    parsed = _parse_token(token)
+    if parsed is None:
+        return False
+    ts, nonce, mac = parsed
+    expected_mac = _sign(secret, session_id, f"{ts:010d}", nonce)
+    if not hmac.compare_digest(expected_mac, mac):
+        return False
+    floor = _REVOCATION_FLOORS.get(
+        (_secret_fingerprint(secret), session_id)
+    )
+    if floor is not None and ts < floor:
+        return False
+    return True
+
 
 def issue(secret: str, session_id: str, nonce: str, now: int) -> str:
     """签发一个绑定到 ``session_id`` 的 95 字符 CSRF token。
@@ -60,7 +154,22 @@ def issue(secret: str, session_id: str, nonce: str, now: int) -> str:
     0..9_999_999_999 范围内的 int（``bool`` 不算 int）。违反约束抛
     ``ValueError``。
     """
-    raise NotImplementedError
+    # 缺陷 1 修复：参数约束先行，session_id 进入 MAC，token 天然绑定会话。
+    if not isinstance(secret, str) or secret == "":
+        raise ValueError("secret must be a non-empty str")
+    if not _valid_session_id(session_id):
+        raise ValueError("session_id must match [A-Za-z0-9._-]{1,64}")
+    if not _valid_nonce(nonce):
+        raise ValueError("nonce must be exactly 16 lowercase hex characters")
+    if not _is_int(now) or not 0 <= now <= 9_999_999_999:
+        raise ValueError("now must be an int in 0..9_999_999_999")
+
+    ts_str = f"{now:010d}"
+    mac = _sign(secret, session_id, ts_str, nonce)
+    token = f"{TOKEN_PREFIX}:{ts_str}:{nonce}:{mac}"
+    if len(token) != TOKEN_LENGTH:
+        raise ValueError("issued token has unexpected length")
+    return token
 
 
 def verify(secret: str, session_id: str, token: str, now: int) -> bool:
@@ -81,7 +190,24 @@ def verify(secret: str, session_id: str, token: str, now: int) -> bool:
       ``ts`` 早于下限的 token 无效；
     * 畸形输入、错误类型、空值一律返回 False，不抛异常。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(secret, str) or secret == "":
+            return False
+        if not _valid_session_id(session_id):
+            return False
+        # 缺陷 3/4 修复：重算 HMAC 并以恒定时间比较，绝不能只看格式。
+        if not _signed_and_not_revoked(secret, session_id, token):
+            return False
+        parsed = _parse_token(token)
+        if parsed is None:
+            return False
+        ts = parsed[0]
+        # 缺陷 2 修复：时间戳按秒解释，TTL 窗口（含边界、拒绝未来时间戳）。
+        if not ttl_ok(ts, now, TOKEN_TTL):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def double_submit(secret: str, cookie_token: str, form_token: str,
@@ -100,7 +226,28 @@ def double_submit(secret: str, cookie_token: str, form_token: str,
     本函数没有 ``now`` 参数，因此只验签、绑定与撤销状态，不判定 TTL；过期判定由
     :func:`verify` 或 :func:`csrf_batch` 完成。畸形输入返回 False，不抛异常。
     """
-    raise NotImplementedError
+    try:
+        if not isinstance(secret, str) or secret == "":
+            return False
+        if not _valid_session_id(session_id):
+            return False
+        if not isinstance(cookie_token, str) or cookie_token == "":
+            return False
+        if not isinstance(form_token, str) or form_token == "":
+            return False
+        # 缺陷 5 修复：两处相等也必须用恒定时间比较，且相等不等于合法——
+        # 攻击者可以把伪造值同时塞进 cookie 和 form。
+        if not hmac.compare_digest(cookie_token, form_token):
+            return False
+        # 缺陷 6 修复：两个值都必须是绑定当前 session_id 的有效签名，
+        # 其他会话签发的 token 一律拒绝；同时检查轮换撤销下限。
+        if not _signed_and_not_revoked(secret, session_id, cookie_token):
+            return False
+        if not _signed_and_not_revoked(secret, session_id, form_token):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def rotate(secret: str, session_id: str, now: int) -> str:
@@ -120,7 +267,25 @@ def rotate(secret: str, session_id: str, now: int) -> str:
     参数约束与 :func:`issue` 相同。新 token 的 TTL 仍为 300 秒，签名比较方式仍为
     ``hmac.compare_digest``，时钟容差仍为 0 秒。
     """
-    raise NotImplementedError
+    if not isinstance(secret, str) or secret == "":
+        raise ValueError("secret must be a non-empty str")
+    if not _valid_session_id(session_id):
+        raise ValueError("session_id must match [A-Za-z0-9._-]{1,64}")
+    if not _is_int(now) or not 0 <= now <= 9_999_999_999:
+        raise ValueError("now must be an int in 0..9_999_999_999")
+
+    key = (_secret_fingerprint(secret), session_id)
+    current_floor = _REVOCATION_FLOORS.get(key)
+    if current_floor is not None and now <= current_floor:
+        raise ValueError(
+            "rotate now must be strictly greater than the current floor"
+        )
+
+    nonce = nonce_for(session_id, now)
+    new_token = issue(secret, session_id, nonce, now)
+    # 缺陷 7 修复：记录撤销下限，旧 token（ts < now）立即失效、不可重放。
+    _REVOCATION_FLOORS[key] = now
+    return new_token
 
 
 def nonce_for(session_id: str, counter: int) -> str:
@@ -137,7 +302,15 @@ def nonce_for(session_id: str, counter: int) -> str:
 
     本函数不使用随机源或系统时间；调用方应在会话内单调递增 ``counter``。
     """
-    raise NotImplementedError
+    if not _valid_session_id(session_id):
+        raise ValueError("session_id must match [A-Za-z0-9._-]{1,64}")
+    if not _is_int(counter) or counter < 0:
+        raise ValueError("counter must be a non-negative int")
+    # 缺陷 8 修复：session_id 参与哈希，不同会话在同一 counter 上不再碰撞。
+    digest = hashlib.sha256(
+        f"{session_id}:{counter}".encode("utf-8")
+    ).hexdigest()
+    return digest[:NONCE_LENGTH]
 
 
 def ttl_ok(ts: int, now: int, ttl: int) -> bool:
@@ -153,7 +326,15 @@ def ttl_ok(ts: int, now: int, ttl: int) -> bool:
     （``now - ts < 0``）一律无效。``ttl <= 0``（含负数）无效，不能把非正 TTL
     解释成无限有效期。时钟偏移容差固定为 **0 秒**，本函数不提供 skew 参数。
     """
-    raise NotImplementedError
+    # 缺陷 9 修复：严格类型与范围校验，负/零 TTL 直接判 False，
+    # 不存在“负有效期 = 永不过期”的解释路径。
+    if not _is_int(ts) or ts < 0:
+        return False
+    if not _is_int(now) or now < 0:
+        return False
+    if not _is_int(ttl) or not 1 <= ttl <= MAX_TTL:
+        return False
+    return 0 <= now - ts <= ttl
 
 
 def validate_config(config: dict) -> list[str]:
@@ -171,7 +352,29 @@ def validate_config(config: dict) -> list[str]:
     缺失字段按对应问题处理；``config`` 不是映射时返回全部三个问题代码。本函数
     只返回问题列表，不抛异常。比较方式非恒定时间属于必须拦截的安全配置错误。
     """
-    raise NotImplementedError
+    if not hasattr(config, "get"):
+        return [
+            "secret_too_short",
+            "ttl_out_of_range",
+            "compare_not_constant_time",
+        ]
+
+    problems: list[str] = []
+    secret = config.get("secret")
+    if (
+        not isinstance(secret, str)
+        or len(secret.encode("utf-8")) < MIN_SECRET_BYTES
+    ):
+        problems.append("secret_too_short")
+
+    ttl = config.get("ttl")
+    if not _is_int(ttl) or not 1 <= ttl <= MAX_TTL:
+        problems.append("ttl_out_of_range")
+
+    if config.get("compare") != CONSTANT_TIME_COMPARE:
+        problems.append("compare_not_constant_time")
+
+    return problems
 
 
 def csrf_batch(requests: list[dict], config: dict) -> dict:
@@ -201,4 +404,52 @@ def csrf_batch(requests: list[dict], config: dict) -> dict:
     secret 外，请求之间不得共享状态。字段缺失/类型错误使该 id 为 False；id 缺失
     或重复抛 ``ValueError``。
     """
-    raise NotImplementedError
+    # 先做 id 完整性检查：缺失或重复一律 ValueError。
+    seen_ids: set = set()
+    ordered_ids: list = []
+    for request in requests:
+        if not hasattr(request, "get") or "id" not in request:
+            raise ValueError("each request must contain an id")
+        request_id = request["id"]
+        if request_id in seen_ids:
+            raise ValueError(f"duplicate request id: {request_id!r}")
+        seen_ids.add(request_id)
+        ordered_ids.append(request_id)
+
+    # 坏配置不放行任何请求。
+    if validate_config(config):
+        return {request_id: False for request_id in ordered_ids}
+
+    secret = config["secret"]
+    config_ttl = config["ttl"]
+    results: dict = {}
+
+    for request in requests:
+        request_id = request["id"]
+        try:
+            session_id = request["session_id"]
+            cookie_token = request["cookie_token"]
+            form_token = request["form_token"]
+            request_now = request["now"]
+            if not _is_int(request_now):
+                results[request_id] = False
+                continue
+
+            # 缺陷 10 修复：每条请求独立调用 double_submit，并只从该请求
+            # 自己的 cookie_token 解析时间戳；不缓存、不复用前一条的任何结果。
+            if not double_submit(
+                secret, cookie_token, form_token, session_id
+            ):
+                results[request_id] = False
+                continue
+
+            parsed = _parse_token(cookie_token)
+            if parsed is None:
+                results[request_id] = False
+                continue
+            ts = parsed[0]
+            results[request_id] = ttl_ok(ts, request_now, config_ttl)
+        except Exception:
+            results[request_id] = False
+
+    return results
